@@ -11,22 +11,45 @@
 #   - https://pkgs.org/ - resource for finding needed packages
 #   - Ex: hexpm/elixir:1.17.2-erlang-27.0-debian-bullseye-20240701-slim
 #
-ARG ELIXIR_VERSION=1.18.2
-ARG OTP_VERSION=27.2.1
-ARG DEBIAN_VERSION=ubuntu-jammy-20240808
-ARG RUNNER_DEBIAN_VERSION=jammy-20240808
+# 1.18.4-erlang-27.3.4.14-ubuntu-jammy-20260627 <- Current Image
+ARG ELIXIR_VERSION=1.18.4
+ARG OTP_VERSION=27.3.4.14
+ARG DEBIAN_VERSION=ubuntu-jammy-20260627
+ARG RUNNER_DEBIAN_VERSION=jammy-20260627
 
 ARG BUILDER_IMAGE="hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-${DEBIAN_VERSION}"
 ARG RUNNER_IMAGE="ubuntu:${RUNNER_DEBIAN_VERSION}"
 
 FROM ${BUILDER_IMAGE} as builder
 
-# install build dependencies
+# install build dependencies and python
 RUN apt-get update -y && apt-get install -y build-essential git npm \
+  python3 python3-venv \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
+
+# install a pinned uv binary (avoids curl | sh executing an unpinned,
+# unverified remote script as root on every build)
+COPY --from=ghcr.io/astral-sh/uv:0.6.16 /uv /uvx /usr/local/bin/
 
 # prepare build dir
 WORKDIR /app
+
+# set up the python venv, install deps, and pre-download the
+# vyakyarth model weights used in advanced search (~1.1GB, the heaviest
+# step in this build). Copied in and run before any Elixir/Phoenix step,
+# on its own COPY, so this layer's cache key depends only on lib/python's
+# own content - it's untouched by changes to mix.exs, other lib/**/*.ex
+# files, assets, etc.
+# --locked asserts uv.lock matches pyproject.toml and fails instead of
+# re-resolving, so transitive dependency versions are pinned and builds
+# are reproducible. --no-install-project skips installing this directory
+# as a package - lib/python is just scripts, not something imported.
+# HF_HOME pins the download location inside the project dir instead of the
+# default ~/.cache, so it's copyable into the runner stage below.
+COPY lib/python lib/python
+ENV HF_HOME=/app/lib/python/.cache/huggingface
+RUN cd lib/python && uv sync --locked --no-install-project \
+  && .venv/bin/python -c "import text_vec; text_vec.initialize()"
 
 # install hex + rebar
 RUN mix local.hex --force && \
@@ -72,6 +95,7 @@ FROM ${RUNNER_IMAGE}
 
 RUN apt-get update -y && \
   apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+  python3 python3-venv \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
 # Set the locale
@@ -87,6 +111,12 @@ RUN chown nobody /app
 # set runner ENV
 ENV MIX_ENV="prod"
 
+# bring the python venv (deps + pre-downloaded model cache)
+# into the runner image, and point HF_HOME at the same spot so the
+# app finds the model without re-downloading it at runtime.
+COPY --from=builder --chown=nobody:root /app/lib/python /app/lib/python
+ENV HF_HOME=/app/lib/python/.cache/huggingface
+
 # Only copy the final release from the build stage
 COPY --from=builder --chown=nobody:root /app/_build/${MIX_ENV}/rel/uli_community ./
 
@@ -97,4 +127,4 @@ USER nobody
 # above and adding an entrypoint. See https://github.com/krallin/tini for details
 # ENTRYPOINT ["/tini", "--"]
 
-CMD ["/app/bin/server"]
+CMD ["/app/bin/uli_community", "start"]
